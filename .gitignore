@@ -1,0 +1,8 @@
+*.log
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+chromedriver*
+chrome_profile/
