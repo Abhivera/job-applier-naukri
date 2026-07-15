@@ -39,6 +39,7 @@ class AppConfig:
     locations: list[str]
     experience: str
     salary: str
+    job_age: int
     title_include_keywords: list[str]
     title_exclude_keywords: list[str]
     chrome_driver_path: str
@@ -89,6 +90,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         locations=locations,
         experience=parser.get("JOB_SEARCH", "experience", fallback="").strip(),
         salary=parser.get("JOB_SEARCH", "salary", fallback="").strip(),
+        job_age=parser.getint("JOB_SEARCH", "job_age", fallback=1),
         title_include_keywords=title_include_keywords,
         title_exclude_keywords=title_exclude_keywords,
         chrome_driver_path=parser.get("DEFAULT", "chrome_driver_path", fallback="").strip(),
@@ -341,9 +343,9 @@ class NaukriAutoApply:
         location_encoded = quote(location)
         experience_encoded = quote_plus(self.config.experience)
         search_urls = [
-            f"https://www.naukri.com/{keyword_encoded}-jobs-in-{location_encoded}?experience={experience_encoded}&jobAge=1",
-            f"https://www.naukri.com/jobs?k={keyword_encoded}&l={location_encoded}&jobAge=1",
-            f"https://www.naukri.com/{keyword_encoded}-jobs?l={location_encoded}&jobAge=1",
+            f"https://www.naukri.com/{keyword_encoded}-jobs-in-{location_encoded}?experience={experience_encoded}&jobAge={self.config.job_age}",
+            f"https://www.naukri.com/jobs?k={keyword_encoded}&l={location_encoded}&experience={experience_encoded}&jobAge={self.config.job_age}",
+            f"https://www.naukri.com/{keyword_encoded}-jobs?l={location_encoded}&experience={experience_encoded}&jobAge={self.config.job_age}",
         ]
 
         for search_url in search_urls:
@@ -428,6 +430,9 @@ class NaukriAutoApply:
 
     def apply_date_filter(self):
         date_selectors = [
+            (By.XPATH, "//span[contains(text(),'Freshness')]"),
+            (By.XPATH, "//div[contains(text(),'Freshness')]"),
+            (By.XPATH, "//h3[contains(text(),'Freshness')]"),
             (By.XPATH, "//span[contains(text(),'Date Posted')]"),
             (By.XPATH, "//div[contains(text(),'Date Posted')]"),
             (By.CSS_SELECTOR, "[data-cy='date-filter']"),
@@ -437,22 +442,36 @@ class NaukriAutoApply:
         ]
         date_dropdown = self.find_element_by_multiple_selectors(date_selectors, timeout=3)
         if not date_dropdown or not self.safe_click(date_dropdown):
-            print("Date filter not found; skipping.")
+            print("Freshness/Date filter not found; skipping.")
             return
 
         time.sleep(2)
+        age = self.config.job_age
+        if age == 1:
+            option_texts = ["24 hours", "Last 24 hours", "Today", "1 day"]
+        elif age <= 3:
+            option_texts = ["3 days", "Last 3 days"]
+        elif age <= 7:
+            option_texts = ["7 days", "Last 7 days"]
+        elif age <= 15:
+            option_texts = ["15 days", "Last 15 days"]
+        else:
+            option_texts = [f"{age} days", f"Last {age} days"]
+
+        or_clause = " or ".join([f"contains(text(),'{t}')" for t in option_texts])
         option_selector = (
-            "//li[contains(text(),'24 hours') or contains(text(),'Last 24 hours') or contains(text(),'Today')]"
-            "|//div[contains(text(),'24 hours') or contains(text(),'Last 24 hours') or contains(text(),'Today')]"
-            "|//label[contains(text(),'24 hours') or contains(text(),'Last 24 hours') or contains(text(),'Today')]"
+            f"//li[{or_clause}]"
+            f"|//div[{or_clause}]"
+            f"|//label[{or_clause}]"
+            f"|//span[{or_clause}]"
         )
         for option in self.driver.find_elements(By.XPATH, option_selector):
             if self.safe_click(option):
-                print("Applied 24 hours date filter.")
+                print(f"Applied {age}-day(s) freshness/date filter.")
                 time.sleep(2)
                 return
 
-        print("Could not find 24 hours filter option.")
+        print(f"Could not find {age}-day(s) filter option.")
 
     def apply_named_filter(self, label, value):
         if not value:
@@ -834,6 +853,7 @@ def main():
         print("Config OK.")
         print(f"Keywords: {', '.join(app_config.keywords)}")
         print(f"Locations: {', '.join(app_config.locations)}")
+        print(f"Job Age (Freshness): {app_config.job_age} day(s)")
         print(f"Title Include Filters: {', '.join(app_config.title_include_keywords)}")
         print(f"Title Exclude Filters: {', '.join(app_config.title_exclude_keywords)}")
         print(f"Dry run: {app_config.dry_run}")
