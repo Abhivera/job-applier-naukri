@@ -1,8 +1,53 @@
-*.log
+# --- Secrets & local config ---
 .env
-.venv/
-venv/
+.env.*
+!.env.example
+*.pem
+credentials*.json
+secrets.*
+
+# --- Python ---
 __pycache__/
 *.py[cod]
-chromedriver*
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Browser / Selenium ---
 chrome_profile/
+chromedriver*
+*.log
+
+# --- Personal candidate data (keep examples only) ---
+profile_memory.md
+profiles/*
+!profiles/README.md
+!profiles/example-candidate.md
+abhijit-verma*.md
+resumes/*
+!resumes/.gitkeep
+
+# --- Application records ---
+data/*
+!data/.gitkeep
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Local tooling ---
+.agents/
+.cursor/

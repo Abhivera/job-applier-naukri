@@ -1,2 +1,8 @@
-selenium>=4.0.0
-webdriver-manager>=4.0.0
+# Naukri AutoApply — pip install -r requirements.txt
+#
+# Selenium 4+ ships Selenium Manager (auto ChromeDriver).
+# tzdata is needed on Windows for Asia/Kolkata in schedule_bot.py.
+
+selenium>=4.15.0,<5
+python-dotenv>=1.0.0
+tzdata>=2024.1
