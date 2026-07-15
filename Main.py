@@ -39,6 +39,9 @@ class AppConfig:
     locations: list[str]
     experience: str
     salary: str
+    job_age: int
+    title_include_keywords: list[str]
+    title_exclude_keywords: list[str]
     chrome_driver_path: str
     chrome_profile_dir: str
     headless: bool
@@ -48,6 +51,7 @@ class AppConfig:
     max_applications: int
     wait_seconds: int
     login_timeout_seconds: int
+    chrome_debugging_port: int | None
 
 
 def split_csv(value: str) -> list[str]:
@@ -61,6 +65,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     email = os.getenv("NAUKRI_EMAIL", parser.get("NAUKRI", "email", fallback="")).strip()
     keywords = split_csv(parser.get("JOB_SEARCH", "keywords", fallback=""))
     locations = split_csv(parser.get("JOB_SEARCH", "locations", fallback=""))
+    title_include_keywords = split_csv(parser.get("JOB_SEARCH", "title_include_keywords", fallback=""))
+    title_exclude_keywords = split_csv(parser.get("JOB_SEARCH", "title_exclude_keywords", fallback=""))
 
     missing = []
     if not keywords:
@@ -75,12 +81,18 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     if not profile_dir:
         profile_dir = str(DEFAULT_CHROME_PROFILE)
 
+    debugging_port_val = parser.get("DEFAULT", "chrome_debugging_port", fallback="").strip()
+    chrome_debugging_port = int(debugging_port_val) if debugging_port_val.isdigit() else None
+
     return AppConfig(
         email=email,
         keywords=keywords,
         locations=locations,
         experience=parser.get("JOB_SEARCH", "experience", fallback="").strip(),
         salary=parser.get("JOB_SEARCH", "salary", fallback="").strip(),
+        job_age=parser.getint("JOB_SEARCH", "job_age", fallback=1),
+        title_include_keywords=title_include_keywords,
+        title_exclude_keywords=title_exclude_keywords,
         chrome_driver_path=parser.get("DEFAULT", "chrome_driver_path", fallback="").strip(),
         chrome_profile_dir=profile_dir,
         headless=parser.getboolean("DEFAULT", "headless", fallback=False),
@@ -90,6 +102,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         max_applications=parser.getint("LIMITS", "max_applications", fallback=5),
         wait_seconds=parser.getint("LIMITS", "wait_seconds", fallback=20),
         login_timeout_seconds=parser.getint("LIMITS", "login_timeout_seconds", fallback=600),
+        chrome_debugging_port=chrome_debugging_port,
     )
 
 
@@ -105,6 +118,7 @@ class NaukriAutoApply:
             headless=self.config.headless,
             chrome_driver_path=self.config.chrome_driver_path,
             chrome_profile_dir=self.config.chrome_profile_dir,
+            chrome_debugging_port=self.config.chrome_debugging_port,
         )
         self.driver.execute_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -329,9 +343,9 @@ class NaukriAutoApply:
         location_encoded = quote(location)
         experience_encoded = quote_plus(self.config.experience)
         search_urls = [
-            f"https://www.naukri.com/{keyword_encoded}-jobs-in-{location_encoded}?experience={experience_encoded}&jobAge=1",
-            f"https://www.naukri.com/jobs?k={keyword_encoded}&l={location_encoded}&jobAge=1",
-            f"https://www.naukri.com/{keyword_encoded}-jobs?l={location_encoded}&jobAge=1",
+            f"https://www.naukri.com/{keyword_encoded}-jobs-in-{location_encoded}?experience={experience_encoded}&jobAge={self.config.job_age}",
+            f"https://www.naukri.com/jobs?k={keyword_encoded}&l={location_encoded}&experience={experience_encoded}&jobAge={self.config.job_age}",
+            f"https://www.naukri.com/{keyword_encoded}-jobs?l={location_encoded}&experience={experience_encoded}&jobAge={self.config.job_age}",
         ]
 
         for search_url in search_urls:
@@ -416,6 +430,9 @@ class NaukriAutoApply:
 
     def apply_date_filter(self):
         date_selectors = [
+            (By.XPATH, "//span[contains(text(),'Freshness')]"),
+            (By.XPATH, "//div[contains(text(),'Freshness')]"),
+            (By.XPATH, "//h3[contains(text(),'Freshness')]"),
             (By.XPATH, "//span[contains(text(),'Date Posted')]"),
             (By.XPATH, "//div[contains(text(),'Date Posted')]"),
             (By.CSS_SELECTOR, "[data-cy='date-filter']"),
@@ -425,22 +442,36 @@ class NaukriAutoApply:
         ]
         date_dropdown = self.find_element_by_multiple_selectors(date_selectors, timeout=3)
         if not date_dropdown or not self.safe_click(date_dropdown):
-            print("Date filter not found; skipping.")
+            print("Freshness/Date filter not found; skipping.")
             return
 
         time.sleep(2)
+        age = self.config.job_age
+        if age == 1:
+            option_texts = ["24 hours", "Last 24 hours", "Today", "1 day"]
+        elif age <= 3:
+            option_texts = ["3 days", "Last 3 days"]
+        elif age <= 7:
+            option_texts = ["7 days", "Last 7 days"]
+        elif age <= 15:
+            option_texts = ["15 days", "Last 15 days"]
+        else:
+            option_texts = [f"{age} days", f"Last {age} days"]
+
+        or_clause = " or ".join([f"contains(text(),'{t}')" for t in option_texts])
         option_selector = (
-            "//li[contains(text(),'24 hours') or contains(text(),'Last 24 hours') or contains(text(),'Today')]"
-            "|//div[contains(text(),'24 hours') or contains(text(),'Last 24 hours') or contains(text(),'Today')]"
-            "|//label[contains(text(),'24 hours') or contains(text(),'Last 24 hours') or contains(text(),'Today')]"
+            f"//li[{or_clause}]"
+            f"|//div[{or_clause}]"
+            f"|//label[{or_clause}]"
+            f"|//span[{or_clause}]"
         )
         for option in self.driver.find_elements(By.XPATH, option_selector):
             if self.safe_click(option):
-                print("Applied 24 hours date filter.")
+                print(f"Applied {age}-day(s) freshness/date filter.")
                 time.sleep(2)
                 return
 
-        print("Could not find 24 hours filter option.")
+        print(f"Could not find {age}-day(s) filter option.")
 
     def apply_named_filter(self, label, value):
         if not value:
@@ -515,6 +546,26 @@ class NaukriAutoApply:
                 continue
         return []
 
+    def is_title_matching(self, job_title: str) -> bool:
+        if not job_title:
+            return False
+
+        title_lower = job_title.lower()
+
+        # Check exclusion list first
+        for exclude_keyword in self.config.title_exclude_keywords:
+            if exclude_keyword.lower() in title_lower:
+                return False
+
+        # Check inclusion list if it's set
+        if self.config.title_include_keywords:
+            for include_keyword in self.config.title_include_keywords:
+                if include_keyword.lower() in title_lower:
+                    return True
+            return False
+
+        return True
+
     def process_single_job(self, job, index):
         try:
             self.driver.execute_script("arguments[0].scrollIntoView(true);", job)
@@ -524,6 +575,11 @@ class NaukriAutoApply:
             company = self.extract_company(job)
             if not job_link:
                 print(f"No clickable link found for job {index}: {job_title} at {company}")
+                return 0
+
+            # Filter by title keywords to only apply to relevant roles
+            if not self.is_title_matching(job_title):
+                print(f"Skipping job {index}: '{job_title}' at {company} (does not match title filters)")
                 return 0
 
             print(f"Opening job details for: {job_title} at {company}")
@@ -718,35 +774,40 @@ def parse_args():
     return parser.parse_args()
 
 
-def create_chrome_driver(headless=False, chrome_driver_path="", chrome_profile_dir=""):
+def create_chrome_driver(headless=False, chrome_driver_path="", chrome_profile_dir="", chrome_debugging_port=None):
     chrome_options = Options()
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-background-timer-throttling")
-    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-    chrome_options.add_argument("--disable-renderer-backgrounding")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option("useAutomationExtension", False)
 
-    profile_path = None
-    if chrome_profile_dir:
-        profile_path = Path(chrome_profile_dir).resolve()
-        profile_path.mkdir(parents=True, exist_ok=True)
-        # Stale locks from a crashed run prevent Chrome from starting.
-        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            lock_file = profile_path / lock_name
-            if lock_file.exists():
-                try:
-                    lock_file.unlink()
-                except OSError:
-                    pass
-        chrome_options.add_argument(f"--user-data-dir={profile_path}")
-        chrome_options.add_argument("--profile-directory=Default")
+    if chrome_debugging_port:
+        chrome_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{chrome_debugging_port}")
+        profile_path = None
+    else:
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
 
-    if headless:
-        chrome_options.add_argument("--headless=new")
+        profile_path = None
+        if chrome_profile_dir:
+            profile_path = Path(chrome_profile_dir).resolve()
+            profile_path.mkdir(parents=True, exist_ok=True)
+            # Stale locks from a crashed run prevent Chrome from starting.
+            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                lock_file = profile_path / lock_name
+                if lock_file.exists():
+                    try:
+                        lock_file.unlink()
+                    except OSError:
+                        pass
+            chrome_options.add_argument(f"--user-data-dir={profile_path}")
+            chrome_options.add_argument("--profile-directory=Default")
+
+        if headless:
+            chrome_options.add_argument("--headless=new")
 
     try:
         if chrome_driver_path:
@@ -792,6 +853,9 @@ def main():
         print("Config OK.")
         print(f"Keywords: {', '.join(app_config.keywords)}")
         print(f"Locations: {', '.join(app_config.locations)}")
+        print(f"Job Age (Freshness): {app_config.job_age} day(s)")
+        print(f"Title Include Filters: {', '.join(app_config.title_include_keywords)}")
+        print(f"Title Exclude Filters: {', '.join(app_config.title_exclude_keywords)}")
         print(f"Dry run: {app_config.dry_run}")
         print(f"Chrome profile: {app_config.chrome_profile_dir}")
         return

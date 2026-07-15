@@ -42,6 +42,7 @@ python Main.py --check-config
 ## Run
 
 ```bash
+.\.venv\Scripts\python.exe Main.py
 python Main.py
 ```
 
