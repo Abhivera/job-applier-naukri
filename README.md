@@ -148,6 +148,8 @@ Example line:
 [14:32:05] APPLIED | AI Engineer | Acme Labs | https://www.naukri.com/job-listings-... | reason: naukri apply
 ```
 
+**No duplicates:** the same Naukri job id is logged only once per day (across Applied / Skipped / External). Search `sid` / `xp` query params are ignored. Already-seen listings are skipped without reopening. `LIMIT` is written at most once per day. Daily apply count uses unique job ids.
+
 ## LLM usage
 
 - Search and browsing never call the LLM.

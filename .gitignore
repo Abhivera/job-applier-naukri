@@ -38,6 +38,7 @@ resumes/*
 # --- Application records ---
 data/*
 !data/.gitkeep
+*.dupbak
 
 # --- IDE / OS ---
 .idea/

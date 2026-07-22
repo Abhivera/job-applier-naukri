@@ -28,6 +28,7 @@ except ImportError:
 
 from job_log import (
     BASE_DIR,
+    already_logged_today,
     count_todays_applies,
     normalize_job_url,
     record_application,
@@ -596,14 +597,48 @@ class NaukriAutoApply:
                         print("Session lost during job search.")
                         return
 
+                    if remaining_daily_applies(self.config.daily_apply_limit) <= 0:
+                        print("Daily apply budget already used — stopping further searches.")
+                        self._log_daily_limit_once()
+                        return
+
                     print(f"Searching for: {keyword} in {location}")
                     if self.search_by_url(keyword, location) or self.manual_search(keyword, location):
                         self.apply_filters()
-                        self.process_job_listings()
+                        keep_going = self.process_job_listings()
+                        if not keep_going:
+                            return
                     else:
                         print(f"Could not search for {keyword} in {location}")
                 except WebDriverException as error:
                     print(f"Error searching for {keyword} in {location}: {error}")
+
+    def _log_daily_limit_once(self, reason: str = "") -> None:
+        used = count_todays_applies()
+        result = record_application(
+            "N/A",
+            "Naukri",
+            job_url="",
+            status="limit",
+            reason=reason
+            or (
+                f"daily apply limit exhausted "
+                f"({used}/{self.config.daily_apply_limit} in Applied log)"
+            ),
+        )
+        if result.duplicate:
+            print(f"Daily limit already logged in: {result.path.relative_to(BASE_DIR)}")
+        else:
+            print(f"Recorded in: {result.path.relative_to(BASE_DIR)}")
+
+    def _note_log_result(self, result) -> None:
+        if result.duplicate:
+            print(
+                f"Already logged today as {result.kind} "
+                f"({result.fingerprint or 'same job'}) — not writing again."
+            )
+        else:
+            print(f"Recorded in: {result.path.relative_to(BASE_DIR)}")
 
     def search_by_url(self, keyword, location):
         keyword_encoded = quote(keyword)
@@ -796,9 +831,10 @@ class NaukriAutoApply:
         )
         return any(marker in text for marker in markers)
 
-    def process_job_listings(self):
+    def process_job_listings(self) -> bool:
+        """Process current search results. Returns False if the whole search should stop."""
         if not self.ensure_session_active():
-            return
+            return False
 
         apply_cap = self.effective_apply_cap()
         if apply_cap <= 0:
@@ -807,25 +843,15 @@ class NaukriAutoApply:
                 f"Daily Naukri apply limit reached "
                 f"({used}/{self.config.daily_apply_limit} today). Stopping."
             )
-            log_path = record_application(
-                "N/A",
-                "Naukri",
-                job_url="",
-                status="limit",
-                reason=(
-                    f"daily apply limit exhausted "
-                    f"({used}/{self.config.daily_apply_limit} in Applied log)"
-                ),
-            )
-            print(f"Recorded in: {log_path.relative_to(BASE_DIR)}")
-            return
+            self._log_daily_limit_once()
+            return False
 
         page = 1
         applied_count = 0
         while page <= self.config.max_pages:
             if not self.ensure_session_active():
                 print("Session lost during job processing.")
-                return
+                return False
 
             print(f"Processing page {page}...")
             job_listings = self.find_job_listings()
@@ -838,25 +864,25 @@ class NaukriAutoApply:
                 applied_count += self.process_single_job(job, index)
                 if self.page_shows_daily_limit():
                     print("Naukri daily apply limit message detected on page. Stopping.")
-                    log_path = record_application(
-                        "N/A",
-                        "Naukri",
-                        job_url="",
-                        status="limit",
-                        reason="naukri daily apply limit reached (~50/day)",
+                    self._log_daily_limit_once(
+                        reason="naukri daily apply limit reached (~50/day)"
                     )
-                    print(f"Recorded in: {log_path.relative_to(BASE_DIR)}")
                     print(f"Total applications submitted this run: {applied_count}")
-                    return
+                    return False
                 if applied_count >= apply_cap:
                     print(f"Reached application limit for this run: {applied_count}/{apply_cap}.")
-                    return
+                    # Per-run cap hit — stop searching more keywords today too if daily remaining is 0
+                    if remaining_daily_applies(self.config.daily_apply_limit) <= 0:
+                        self._log_daily_limit_once()
+                        return False
+                    return True
 
             if not self.go_to_next_page():
                 break
             page += 1
 
         print(f"Total applications submitted: {applied_count}")
+        return True
 
     def find_job_listings(self):
         job_selectors = [
@@ -950,24 +976,54 @@ class NaukriAutoApply:
             company = self.extract_company(job)
             job_url = self.extract_job_url(job, job_link)
 
+            # Same listing across other keyword/location searches — skip without reopening
+            prior = already_logged_today(job_url=job_url, job_title=job_title, company=company)
+            if prior:
+                print(
+                    f"Skipping job {index}: '{job_title}' at {company} "
+                    f"(already logged today as {prior})"
+                )
+                print(f"  link: {job_url or '(no link)'}")
+                return 0
+
             if not job_link:
                 reason = "no clickable job link"
                 print(f"No clickable link found for job {index}: {job_title} at {company}")
-                record_application(job_title, company, job_url=job_url, status="skipped", reason=reason)
+                self._note_log_result(
+                    record_application(
+                        job_title, company, job_url=job_url, status="skipped", reason=reason
+                    )
+                )
                 return 0
 
             title_reason = self.title_skip_reason(job_title)
             if title_reason:
                 print(f"Skipping job {index}: '{job_title}' at {company} ({title_reason})")
                 print(f"  link: {job_url or '(no link)'}")
-                record_application(job_title, company, job_url=job_url, status="skipped", reason=title_reason)
+                self._note_log_result(
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="skipped",
+                        reason=title_reason,
+                    )
+                )
                 return 0
 
             company_reason = self.company_skip_reason(company)
             if company_reason:
                 print(f"Skipping job {index}: '{job_title}' at {company} ({company_reason})")
                 print(f"  link: {job_url or '(no link)'}")
-                record_application(job_title, company, job_url=job_url, status="skipped", reason=company_reason)
+                self._note_log_result(
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="skipped",
+                        reason=company_reason,
+                    )
+                )
                 return 0
 
             print(f"Opening job details for: {job_title} at {company}")
@@ -976,7 +1032,11 @@ class NaukriAutoApply:
             if not opened:
                 reason = "could not open job details"
                 print(f"Could not open job details for: {job_title}")
-                record_application(job_title, company, job_url=job_url, status="skipped", reason=reason)
+                self._note_log_result(
+                    record_application(
+                        job_title, company, job_url=job_url, status="skipped", reason=reason
+                    )
+                )
                 return 0
 
             # Prefer the opened tab URL (canonical) when available
@@ -987,17 +1047,28 @@ class NaukriAutoApply:
             except WebDriverException:
                 pass
 
+            # Re-check after canonical URL is known (sid-stripped id match)
+            prior = already_logged_today(job_url=job_url, job_title=job_title, company=company)
+            if prior:
+                print(
+                    f"Already logged today as {prior}: '{job_title}' at {company} — closing tab."
+                )
+                self.close_extra_tabs(main_window)
+                return 0
+
             applied = self.try_apply(job_title, company, job_url=job_url)
             self.close_extra_tabs(main_window)
             return applied
         except WebDriverException as error:
             print(f"Error processing job {index}: {error}")
             try:
-                record_application(
-                    "Unknown",
-                    "Unknown",
-                    status="skipped",
-                    reason=f"error: {error}",
+                self._note_log_result(
+                    record_application(
+                        "Unknown",
+                        "Unknown",
+                        status="skipped",
+                        reason=f"error: {error}",
+                    )
                 )
             except OSError:
                 pass
@@ -1185,12 +1256,14 @@ class NaukriAutoApply:
             print(f"Skipping job (external website): '{job_title}' at {company}")
             print(f"  reason: {external_reason}")
             print(f"  link: {job_url or '(no link)'}")
-            record_application(
-                job_title,
-                company,
-                job_url=job_url,
-                status="external",
-                reason=external_reason,
+            self._note_log_result(
+                record_application(
+                    job_title,
+                    company,
+                    job_url=job_url,
+                    status="external",
+                    reason=external_reason,
+                )
             )
             return 0
 
@@ -1202,37 +1275,53 @@ class NaukriAutoApply:
                 print(f"Skipping job (external website): '{job_title}' at {company}")
                 print(f"  reason: {self.EXTERNAL_APPLY_REASON}")
                 print(f"  link: {job_url or '(no link)'}")
-                record_application(
-                    job_title,
-                    company,
-                    job_url=job_url,
-                    status="external",
-                    reason=self.EXTERNAL_APPLY_REASON,
+                self._note_log_result(
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="external",
+                        reason=self.EXTERNAL_APPLY_REASON,
+                    )
                 )
                 return 0
 
             if self.config.dry_run:
-                log_path = record_application(
-                    job_title, company, job_url=job_url, status="dry_run", reason="dry_run mode"
-                )
                 print(f"Dry run: would apply to {job_title} at {company}")
-                print(f"Recorded in: {log_path.relative_to(BASE_DIR)}")
+                self._note_log_result(
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="dry_run",
+                        reason="dry_run mode",
+                    )
+                )
                 return 0
 
             if self.safe_click(apply_button):
                 self.handle_apply_confirmation(job_title, company)
-                log_path = record_application(
-                    job_title, company, job_url=job_url, status="applied", reason="naukri apply"
-                )
                 print(f"Successfully applied to: {job_title} at {company}")
-                print(f"Recorded in: {log_path.relative_to(BASE_DIR)}")
+                self._note_log_result(
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="applied",
+                        reason="naukri apply",
+                    )
+                )
                 time.sleep(3)
                 return 1
 
         reason = "no apply button found"
         print(f"No apply button found for: {job_title} at {company} ({reason})")
         print(f"  link: {job_url or '(no link)'}")
-        record_application(job_title, company, job_url=job_url, status="skipped", reason=reason)
+        self._note_log_result(
+            record_application(
+                job_title, company, job_url=job_url, status="skipped", reason=reason
+            )
+        )
         return 0
 
     def _question_label_for_input(self, element) -> str:
