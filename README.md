@@ -196,3 +196,5 @@ requirements.txt
 - If `chrome_profile/` has no session and email/password are set, the bot auto-logs in.
 - Captcha / OTP may need a one-time manual step in Chrome.
 - Close other Chrome windows using the same `chrome_profile` before starting.
+
+.venv\Scripts\python.exe Main.py --now

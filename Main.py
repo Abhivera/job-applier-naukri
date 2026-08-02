@@ -57,6 +57,9 @@ class AppConfig:
     willing_to_relocate: str
     skill_hints: list[str]
     resume_path: str
+    linkedin_url: str
+    github_url: str
+    portfolio_url: str
     keywords: list[str]
     locations: list[str]
     experience: str
@@ -86,12 +89,16 @@ def split_csv(value: str) -> list[str]:
 
 
 def keyword_in_text(keyword: str, text: str) -> bool:
-    """Match keyword in text; short tokens use word boundaries (AI != paid, ML != html)."""
+    """Match keyword in text; short tokens use word boundaries (AI != paid, ML != html, Java != JavaScript)."""
     needle = keyword.lower().strip()
     haystack = text.lower()
     if not needle:
         return False
-    if " " in needle or "/" in needle or len(needle) > 3:
+    if " " in needle or "/" in needle:
+        return needle in haystack
+    if needle == "java":
+        return re.search(r"(?<![a-z0-9])java(?![a-z0-9])", haystack) is not None
+    if len(needle) > 3:
         return needle in haystack
     return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", haystack) is not None
 
@@ -149,6 +156,9 @@ def load_config() -> AppConfig:
     pincode = env_str("PINCODE")
     notice_period = env_str("NOTICE_PERIOD", "Will confirm")
     willing_to_relocate = env_str("WILLING_TO_RELOCATE", "Yes") or "Yes"
+    linkedin_url = env_str("LINKEDIN_URL")
+    github_url = env_str("GITHUB_URL")
+    portfolio_url = env_str("PORTFOLIO_URL")
 
     resume_raw = env_str("RESUME_PATH")
     resume_path = ""
@@ -222,6 +232,9 @@ def load_config() -> AppConfig:
         willing_to_relocate=willing_to_relocate,
         skill_hints=skill_hints,
         resume_path=resume_path,
+        linkedin_url=linkedin_url,
+        github_url=github_url,
+        portfolio_url=portfolio_url,
         keywords=keywords,
         locations=locations,
         experience=env_str("EXPERIENCE"),
@@ -833,9 +846,19 @@ class NaukriAutoApply:
                 print("No job listings found on this page.")
                 break
 
-            print(f"Found {len(job_listings)} job listings.")
-            for index, job in enumerate(job_listings[: self.config.max_jobs_per_page], start=1):
-                applied_count += self.process_single_job(job, index)
+            total_listings = len(job_listings)
+            print(f"Found {total_listings} job listings.")
+            max_jobs = min(total_listings, self.config.max_jobs_per_page)
+
+            for index in range(max_jobs):
+                # Re-fetch listings to avoid stale element reference
+                fresh_listings = self.find_job_listings()
+                if not fresh_listings or index >= len(fresh_listings):
+                    print("Listings changed or not found during re-fetch.")
+                    break
+                job = fresh_listings[index]
+                applied_count += self.process_single_job(job, index + 1)
+
                 if self.page_shows_daily_limit():
                     print("Naukri daily apply limit message detected on page. Stopping.")
                     log_path = record_application(
@@ -852,7 +875,7 @@ class NaukriAutoApply:
                     print(f"Reached application limit for this run: {applied_count}/{apply_cap}.")
                     return
 
-            if not self.go_to_next_page():
+            if not self.go_to_next_page(page):
                 break
             page += 1
 
@@ -860,9 +883,9 @@ class NaukriAutoApply:
 
     def find_job_listings(self):
         job_selectors = [
+            (By.CSS_SELECTOR, ".srp-jobtuple-wrapper"),
             (By.XPATH, "//article[contains(@class,'jobTuple')]"),
             (By.CSS_SELECTOR, ".jobTuple"),
-            (By.CSS_SELECTOR, ".srp-jobtuple-wrapper"),
             (By.CSS_SELECTOR, "[data-job-id]"),
             (By.XPATH, "//div[contains(@class, 'job-tile')]"),
             (By.XPATH, "//div[@class='row'][.//a[contains(@class,'title')]]"),
@@ -1018,10 +1041,18 @@ class NaukriAutoApply:
         for selector in title_link_selectors:
             try:
                 job_links = job.find_elements(By.CSS_SELECTOR, selector)
-                if job_links:
-                    job_link = job_links[0]
-                    job_title = job_link.text or job_link.get_attribute("title") or "Unknown"
-                    return job_link, job_title
+                for link in job_links:
+                    try:
+                        href = (link.get_attribute("href") or "").lower()
+                        if "ambitionbox" in href or "reviews" in href or "rating" in href:
+                            continue
+                        txt = (link.text or link.get_attribute("title") or "").strip().lower()
+                        if not txt or re.search(r'\b\d+\s*(?:reviews?|ratings?)\b', txt):
+                            continue
+                        job_title = link.text or link.get_attribute("title") or "Unknown"
+                        return link, job_title.strip()
+                    except WebDriverException:
+                        continue
             except WebDriverException:
                 continue
         return None, "Unknown"
@@ -1154,11 +1185,49 @@ class NaukriAutoApply:
             pass
         return None
 
+
+
     def _is_visible_enabled(self, element) -> bool:
         try:
             return element.is_displayed() and element.is_enabled()
         except WebDriverException:
             return False
+
+    def extract_job_description_text(self) -> str:
+        """Extract the full text of the job description from the current job page."""
+        selectors = [
+            ".job-desc",
+            ".jd-desc",
+            "[class*='job-desc']",
+            "[class*='jobDescription']",
+            ".clearText",
+            "#job-desc",
+            "article[class*='job-desc']",
+            "section[class*='job-desc']",
+        ]
+        jd_text = ""
+        for selector in selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        text = (el.text or "").strip()
+                        if len(text) > len(jd_text):
+                            jd_text = text
+            except WebDriverException:
+                continue
+
+        # If none of the selectors matched, fallback to visible body text
+        if not jd_text or len(jd_text) < 100:
+            try:
+                body = self.driver.find_element(By.TAG_NAME, "body")
+                text = (body.text or "").strip()
+                if text:
+                    jd_text = text[:8000] # Cap fallback text to 8000 chars
+            except WebDriverException:
+                pass
+
+        return jd_text.strip()
 
     def try_apply(self, job_title, company, job_url: str = ""):
         apply_selector = (
@@ -1179,6 +1248,23 @@ class NaukriAutoApply:
             pass
         job_url = normalize_job_url(job_url)
 
+        # Detect already applied via page content
+        try:
+            page_text = (self.driver.page_source or "").lower()
+            if any(phrase in page_text for phrase in ("already applied", "you have applied to this job", "you have already applied")):
+                print(f"Skipping job (already applied): '{job_title}' at {company}")
+                print(f"  link: {job_url or '(no link)'}")
+                record_application(
+                    job_title,
+                    company,
+                    job_url=job_url,
+                    status="skipped",
+                    reason="already applied",
+                )
+                return 0
+        except WebDriverException:
+            pass
+
         # Detect company-website / external apply first and log a clear reason
         external_reason = self.detect_external_apply_reason()
         if external_reason:
@@ -1194,9 +1280,45 @@ class NaukriAutoApply:
             )
             return 0
 
+        # Extract Job Description text for LLM context / pre-apply matching
+        jd_text = self.extract_job_description_text()
+
+        # Perform Job Suitability check using LLM before applying
+        if self.answerer:
+            suitable, reason = self.answerer.check_suitability(job_title, company, jd_text)
+            if not suitable:
+                print(f"Skipping job (unsuitable): '{job_title}' at {company}")
+                print(f"  reason: {reason}")
+                print(f"  link: {job_url or '(no link)'}")
+                record_application(
+                    job_title,
+                    company,
+                    job_url=job_url,
+                    status="skipped",
+                    reason=f"unsuitable: {reason}",
+                )
+                return 0
+
         for apply_button in self.driver.find_elements(By.XPATH, apply_selector):
             if not self._is_visible_enabled(apply_button):
                 continue
+
+            # Check if button text indicates already applied
+            try:
+                btn_txt = (apply_button.text or "").strip().lower()
+                if btn_txt.startswith("applied") or "already applied" in btn_txt or btn_txt == "applied":
+                    print(f"Skipping job (already applied): '{job_title}' at {company}")
+                    print(f"  link: {job_url or '(no link)'}")
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="skipped",
+                        reason="already applied",
+                    )
+                    return 0
+            except WebDriverException:
+                pass
 
             if self._button_looks_external(apply_button):
                 print(f"Skipping job (external website): '{job_title}' at {company}")
@@ -1220,7 +1342,7 @@ class NaukriAutoApply:
                 return 0
 
             if self.safe_click(apply_button):
-                self.handle_apply_confirmation(job_title, company)
+                self.handle_apply_confirmation(job_title, company, jd_text)
                 log_path = record_application(
                     job_title, company, job_url=job_url, status="applied", reason="naukri apply"
                 )
@@ -1507,13 +1629,15 @@ class NaukriAutoApply:
             )
         )
 
-    def answer_naukri_chatbot(self, job_title: str, company: str, max_rounds: int = 12) -> int:
+    def answer_naukri_chatbot(self, job_title: str, company: str, max_rounds: int = 12, jd_text: str = "") -> int:
         """Answer Naukri apply chatbot Q&A rounds; always try to Save after each answer."""
         if not self.answerer:
             return 0
 
         answered = 0
-        job_context = f"{job_title} at {company}"
+        job_context = f"Job Title: {job_title}\nCompany: {company}"
+        if jd_text:
+            job_context += f"\nJob Description:\n{jd_text}"
         seen_questions: set[str] = set()
 
         for _ in range(max_rounds):
@@ -1657,98 +1781,143 @@ class NaukriAutoApply:
         )
         return any(token in lowered for token in screening_tokens)
 
-    def answer_screening_questions(self, job_title: str, company: str) -> int:
+    def find_and_switch_to_screening_frame(self) -> bool:
+        """Check all iframes to see if any contain screening UI or chatbots, and switch to it.
+        Returns True if switched, False otherwise.
+        """
+        try:
+            self.driver.switch_to.default_content()
+        except WebDriverException:
+            pass
+
+        if self.is_screening_ui_present():
+            return False
+
+        try:
+            iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+            for iframe in iframes:
+                try:
+                    if iframe.is_displayed():
+                        self.driver.switch_to.frame(iframe)
+                        if self.is_screening_ui_present():
+                            return True
+                        self.driver.switch_to.default_content()
+                except WebDriverException:
+                    try:
+                        self.driver.switch_to.default_content()
+                    except WebDriverException:
+                        pass
+        except WebDriverException:
+            pass
+
+        return False
+
+    def answer_screening_questions(self, job_title: str, company: str, jd_text: str = "") -> int:
         """Use LLM when apply screening / chatbot questions appear."""
         if not self.answerer:
             return 0
 
-        # Prefer Naukri chatbot flow (bot messages + contenteditable + send)
-        chatbot_answered = self.answer_naukri_chatbot(job_title, company)
-        if chatbot_answered:
-            return chatbot_answered
+        in_iframe = self.find_and_switch_to_screening_frame()
+        if in_iframe:
+            print("Switched to iframe for screening UI.")
 
-        if not self.is_screening_ui_present():
-            print("No screening/chat UI detected — LLM not used.")
-            return 0
+        try:
+            # Prefer Naukri chatbot flow (bot messages + contenteditable + send)
+            chatbot_answered = self.answer_naukri_chatbot(job_title, company, jd_text=jd_text)
+            if chatbot_answered:
+                return chatbot_answered
 
-        print("Screening/chat UI detected — switching to LLM for applicable questions.")
-        answered = 0
-        skipped = 0
-        job_context = f"{job_title} at {company}"
-        field_selectors = (
-            "div.textArea[contenteditable='true']",
-            "textarea:not([disabled])",
-            "input[type='text']:not([disabled])",
-            "input:not([type]):not([disabled])",
-            "input[type='number']:not([disabled])",
-            "input[type='tel']:not([disabled])",
-            "div[contenteditable='true']",
-        )
+            if not self.is_screening_ui_present():
+                print("No screening/chat UI detected — LLM not used.")
+                return 0
 
-        for selector in field_selectors:
-            try:
-                fields = self.driver.find_elements(By.CSS_SELECTOR, selector)
-            except WebDriverException:
-                continue
+            print("Screening/chat UI detected — switching to LLM for applicable questions.")
+            answered = 0
+            skipped = 0
+            job_context = f"Job Title: {job_title}\nCompany: {company}"
+            if jd_text:
+                job_context += f"\nJob Description:\n{jd_text}"
+            field_selectors = (
+                "div.textArea[contenteditable='true']",
+                "textarea:not([disabled])",
+                "input[type='text']:not([disabled])",
+                "input:not([type]):not([disabled])",
+                "input[type='number']:not([disabled])",
+                "input[type='tel']:not([disabled])",
+                "div[contenteditable='true']",
+            )
 
-            for field in fields:
+            for selector in field_selectors:
                 try:
-                    if not field.is_displayed() or not field.is_enabled():
-                        continue
-                    existing = (field.get_attribute("value") or field.text or "").strip()
-                    if existing:
-                        continue
+                    fields = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                except WebDriverException:
+                    continue
 
-                    question = self._question_label_for_input(field) or self.get_latest_chatbot_question()
-                    if not self.should_use_llm_for_question(question, field):
-                        skipped += 1
-                        continue
+                for field in fields:
+                    try:
+                        if not field.is_displayed() or not field.is_enabled():
+                            continue
+                        existing = (field.get_attribute("value") or field.text or "").strip()
+                        if existing:
+                            continue
 
-                    answer = self.answerer.answer(question or "Please provide a short professional answer.", job_context=job_context)
-                    if not answer:
-                        continue
+                        question = self._question_label_for_input(field) or self.get_latest_chatbot_question()
+                        if not self.should_use_llm_for_question(question, field):
+                            skipped += 1
+                            continue
 
-                    if self.fill_chatbot_text(answer):
-                        answered += 1
-                        print(f"LLM answered: {(question or '')[:80]} -> {answer[:80]}")
-                        time.sleep(0.8)
-                        continue
+                        answer = self.answerer.answer(question or "Please provide a short professional answer.", job_context=job_context)
+                        if not answer:
+                            continue
 
-                    tag = (field.tag_name or "").lower()
-                    if tag == "div":
-                        self.driver.execute_script(
-                            """
-                            const el = arguments[0];
-                            const text = arguments[1];
-                            el.focus();
-                            el.innerText = text;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            """,
-                            field,
-                            answer,
-                        )
-                        ok = True
-                    else:
-                        ok = self.safe_send_keys(field, answer)
+                        if self.fill_chatbot_text(answer):
+                            answered += 1
+                            print(f"LLM answered: {(question or '')[:80]} -> {answer[:80]}")
+                            time.sleep(0.8)
+                            continue
 
-                    if ok:
-                        answered += 1
-                        print(f"LLM answered: {(question or '')[:80]} -> {answer[:80]}")
-                        time.sleep(0.5)
-                except (WebDriverException, RuntimeError, ValueError, FileNotFoundError) as error:
-                    print(f"Could not answer screening field: {error}")
+                        tag = (field.tag_name or "").lower()
+                        if tag == "div":
+                            self.driver.execute_script(
+                                """
+                                const el = arguments[0];
+                                const text = arguments[1];
+                                el.focus();
+                                el.innerText = text;
+                                el.dispatchEvent(new Event('input', { bubbles: true }));
+                                """,
+                                field,
+                                answer,
+                            )
+                            ok = True
+                        else:
+                            ok = self.safe_send_keys(field, answer)
 
-        if answered == 0 and skipped:
-            print(f"Screening UI present but no LLM-worthy empty questions (skipped {skipped} fields).")
-        elif answered == 0:
-            print("Screening UI present but no empty questions found for LLM.")
-        return answered
+                        if ok:
+                            answered += 1
+                            print(f"LLM answered: {(question or '')[:80]} -> {answer[:80]}")
+                            time.sleep(0.5)
+                    except (WebDriverException, RuntimeError, ValueError, FileNotFoundError) as error:
+                        print(f"Could not answer screening field: {error}")
 
-    def handle_apply_confirmation(self, job_title: str = "", company: str = ""):
+            if answered == 0 and skipped:
+                print(f"Screening UI present but no LLM-worthy empty questions (skipped {skipped} fields).")
+            elif answered == 0:
+                print("Screening UI present but no empty questions found for LLM.")
+            return answered
+        finally:
+            if in_iframe:
+                try:
+                    self.driver.switch_to.default_content()
+                    print("Switched back to default page content.")
+                except WebDriverException:
+                    pass
+
+    def handle_apply_confirmation(self, job_title: str = "", company: str = "", jd_text: str = ""):
         # Naukri chatbot can take a few seconds to appear after Apply
         time.sleep(3)
         try:
-            self.answer_screening_questions(job_title, company)
+            self.answer_screening_questions(job_title, company, jd_text)
         except Exception as error:
             print(f"Screening Q&A skipped due to error: {error}")
 
@@ -1761,34 +1930,71 @@ class NaukriAutoApply:
                 self.safe_click(button)
                 time.sleep(1.5)
                 try:
-                    self.answer_screening_questions(job_title, company)
+                    self.answer_screening_questions(job_title, company, jd_text)
                 except Exception:
                     pass
 
     def close_extra_tabs(self, main_window):
         try:
-            for handle in self.driver.window_handles:
+            handles = self.driver.window_handles
+            if not handles:
+                return
+            if main_window not in handles:
+                main_window = handles[0]
+            for handle in handles:
                 if handle != main_window:
-                    self.driver.switch_to.window(handle)
-                    self.driver.close()
+                    try:
+                        self.driver.switch_to.window(handle)
+                        self.driver.close()
+                    except WebDriverException:
+                        pass
             self.driver.switch_to.window(main_window)
             time.sleep(1)
         except WebDriverException:
             pass
 
-    def go_to_next_page(self):
+    def go_to_next_page(self, current_page_num):
         next_selectors = [
-            (By.XPATH, "//a[contains(@class,'fright') and contains(text(),'Next')]"),
+            (By.XPATH, "//a[contains(translate(normalize-space(.), 'NEXT', 'next'), 'next')]"),
+            (By.XPATH, "//a[contains(@class,'next') or contains(@class,'Next')]"),
             (By.CSS_SELECTOR, ".pagination-next"),
             (By.XPATH, "//a[contains(text(), 'Next')]"),
             (By.CSS_SELECTOR, "[data-cy='next-page']"),
             (By.XPATH, "//a[@aria-label='Next']"),
             (By.CSS_SELECTOR, "a[aria-label='Next']"),
+            (By.XPATH, "//span[contains(text(), 'Next')]/parent::a"),
+            (By.XPATH, "//span[contains(text(), 'Next')]"),
         ]
         next_button = self.find_element_by_multiple_selectors(next_selectors, timeout=5)
         if next_button and next_button.is_enabled() and self.safe_click(next_button):
             time.sleep(5)
             return True
+
+        try:
+            current_url = self.driver.current_url
+            next_page = current_page_num + 1
+            if f"-{current_page_num}?" in current_url:
+                next_url = current_url.replace(f"-{current_page_num}?", f"-{next_page}?")
+            elif f"-{current_page_num}" in current_url.split('?')[0]:
+                path_part, *query_part = current_url.split('?')
+                query_str = f"?{query_part[0]}" if query_part else ""
+                if path_part.endswith(f"-{current_page_num}"):
+                    next_url = path_part[:-len(str(current_page_num))] + str(next_page) + query_str
+                else:
+                    next_url = current_url
+            else:
+                path_part, *query_part = current_url.split('?')
+                query_str = f"?{query_part[0]}" if query_part else ""
+                next_url = f"{path_part}-{next_page}{query_str}"
+
+            print(f"Pagination button click failed/not found. Trying fallback next page URL: {next_url}")
+            self.driver.get(next_url)
+            time.sleep(5)
+            page_source = self.driver.page_source.lower()
+            if "job" in self.driver.current_url and any(marker in page_source for marker in ("results", "apply", "position")):
+                return True
+        except Exception as e:
+            print(f"Fallback pagination failed: {e}")
 
         print("No more pages available.")
         return False

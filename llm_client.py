@@ -206,6 +206,39 @@ Rules:
 """
 
 
+COVER_LETTER_PROMPT = """You write a highly tailored, professional cover letter or short pitch (2-3 sentences max) to a recruiter for a job application.
+Highlight how the candidate's skills and experience match the job description.
+Do NOT mention that you are an AI. Do not use placeholder text (like "[Recruiter Name]" or "[Date]").
+Write in the first-person ("I"). Keep it brief, punchy, and professional.
+
+--- PROFILE MEMORY ---
+{profile_memory}
+--- END PROFILE MEMORY ---
+"""
+
+
+SUITABILITY_PROMPT = """You evaluate if a job is suitable for a candidate based on the candidate's profile memory and preferences, and the job description.
+Rule:
+Determine if there are any critical mismatch barriers.
+A critical mismatch barrier includes:
+1. The job requires a technology stack that is completely different (e.g. Java, C#, PHP, SAP, Salesforce, Angular) and the candidate has no experience in it. (If candidate is a React/Node/Python developer, do not match them to pure Java/C# backend roles).
+2. The job has a strict experience requirement (e.g. "minimum 8 years", "lead level", "principal") and the candidate does not meet it (candidate has 3+ years experience).
+3. The job specifies a salary range or work mode that is completely incompatible with the candidate's minimum requirements.
+
+Reply with exactly:
+SUITABLE: Yes
+Reason: <1-sentence positive reason>
+
+OR:
+SUITABLE: No
+Reason: <1-sentence reason highlighting the critical mismatch>
+
+--- PROFILE MEMORY ---
+{profile_memory}
+--- END PROFILE MEMORY ---
+"""
+
+
 # Fallback only when SKILL_HINTS is empty in .env
 DEFAULT_SKILL_HINTS = (
     "python",
@@ -348,14 +381,40 @@ class ProfileAnswerer:
             return quick
 
         memory = self._load_memory()
-        system = SYSTEM_PROMPT.format(profile_memory=memory)
+        is_cover_letter = any(
+            token in q_lower
+            for token in (
+                "cover letter",
+                "message to recruiter",
+                "why should we hire",
+                "write a pitch",
+                "briefly describe why you are a good fit",
+                "why do you want to join",
+                "why are you interested",
+                "suitability",
+                "tell us about your experience",
+            )
+        )
+        if is_cover_letter:
+            system = COVER_LETTER_PROMPT.format(profile_memory=memory)
+        else:
+            system = SYSTEM_PROMPT.format(profile_memory=memory)
+
         user_parts = [f"Question: {question.strip()}"]
         if job_context.strip():
             user_parts.append(f"Job context: {job_context.strip()}")
-        user_parts.append(
-            "Reply with only the final answer text. "
-            "If the skill is not in the profile, for years questions answer 0."
-        )
+
+        if is_cover_letter:
+            user_parts.append(
+                "Write a tailored, professional pitch or short cover letter (maximum 2 to 3 sentences) "
+                "explaining how the candidate's background matches this job."
+            )
+        else:
+            user_parts.append(
+                "Reply with only the final answer text. "
+                "If the skill is not in the profile, for years questions answer 0."
+            )
+
         try:
             raw = self._get_provider().complete(system, "\n".join(user_parts))
             cleaned = clean_model_answer(raw)
@@ -371,3 +430,34 @@ class ProfileAnswerer:
         if q_lower.startswith("have you") or q_lower.startswith("do you"):
             return "No"
         return "Will confirm"
+
+    def check_suitability(self, job_title: str, company: str, jd_text: str) -> tuple[bool, str]:
+        """Check if the job matches the candidate's profile to prevent low-quality applies.
+        Returns (is_suitable, reason).
+        """
+        if not self.enabled:
+            return True, "LLM disabled; skipped suitability check"
+
+        if not jd_text or len(jd_text) < 100:
+            return True, "No detailed JD text available; skipped suitability check"
+
+        memory = self._load_memory()
+        system = SUITABILITY_PROMPT.format(profile_memory=memory)
+        user_prompt = f"Job Title: {job_title}\nCompany: {company}\nJob Description:\n{jd_text}"
+
+        try:
+            raw = self._get_provider().complete(system, user_prompt)
+            lines = [line.strip() for line in raw.split("\n") if line.strip()]
+            suitable = True
+            reason = "Matches candidate profile"
+            for line in lines:
+                if line.lower().startswith("suitable:"):
+                    val = line.split(":", 1)[1].strip().lower()
+                    if "no" in val:
+                        suitable = False
+                elif line.lower().startswith("reason:"):
+                    reason = line.split(":", 1)[1].strip()
+            return suitable, reason
+        except Exception as error:
+            print(f"Suitability check failed due to error: {error}; defaulting to True.")
+            return True, f"Error in check: {error}"

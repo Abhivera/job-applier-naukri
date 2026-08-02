@@ -32,7 +32,9 @@ profiles/*
 !profiles/README.md
 !profiles/example-candidate.md
 abhijit-verma*.md
+profiles/ullingala-yaswanth.md
 resumes/*
+resumes/Resume.pdf
 !resumes/.gitkeep
 
 # --- Application records ---
