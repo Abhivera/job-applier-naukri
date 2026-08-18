@@ -63,6 +63,7 @@ class AppConfig:
     experience: str
     salary: str
     job_age: int
+    job_max_age_hours: int
     title_include_keywords: list[str]
     title_exclude_keywords: list[str]
     company_exclude_keywords: list[str]
@@ -95,6 +96,43 @@ def keyword_in_text(keyword: str, text: str) -> bool:
     if " " in needle or "/" in needle or len(needle) > 3:
         return needle in haystack
     return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", haystack) is not None
+
+
+def posted_age_hours_from_text(text: str) -> float | None:
+    """Parse Naukri 'posted X ago' labels into approximate hours. None if unknown."""
+    blob = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    if not blob:
+        return None
+    if re.search(r"just now|few seconds|seconds ago|a moment|moments ago", blob):
+        return 0.0
+    minute = re.search(r"(\d+)\s*(?:minute|min)s?\s*ago", blob)
+    if minute:
+        return int(minute.group(1)) / 60.0
+    if re.search(r"(?:a|1)\s+minute\s+ago", blob):
+        return 1.0 / 60.0
+    hour = re.search(r"(\d+)\s*(?:hours?|hrs?)\s*ago", blob)
+    if hour:
+        return float(hour.group(1))
+    if re.search(r"(?:an?|1)\s+hour\s+ago", blob):
+        return 1.0
+    if re.search(r"few\s+hours?\s+ago|couple of hours", blob) and not re.search(
+        r"\b(?:day|week|month)s?\b", blob
+    ):
+        return 6.0
+    if re.search(r"\byesterday\b", blob):
+        return 24.0
+    day = re.search(r"(\d+)\s*days?\s*ago", blob)
+    if day:
+        return float(day.group(1)) * 24.0
+    if re.search(r"(?:a|1)\s+day\s+ago", blob):
+        return 24.0
+    week = re.search(r"(\d+)\s*weeks?\s*ago", blob)
+    if week:
+        return float(week.group(1)) * 24.0 * 7.0
+    month = re.search(r"(\d+)\s*months?\s*ago", blob)
+    if month:
+        return float(month.group(1)) * 24.0 * 30.0
+    return None
 
 
 def env_str(key: str, default: str = "") -> str:
@@ -200,7 +238,7 @@ def load_config() -> AppConfig:
         max_tokens=env_int("LLM_MAX_TOKENS", 256),
         temperature=float(env_str("LLM_TEMPERATURE", "0.2") or "0.2"),
         groq_api_key=env_str("GROQ_API_KEY"),
-        groq_model=env_str("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile",
+        groq_model=env_str("GROQ_MODEL", "openai/gpt-oss-20b") or "openai/gpt-oss-20b",
         groq_base_url=env_str("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
         or "https://api.groq.com/openai/v1",
         ollama_base_url=env_str("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -228,6 +266,7 @@ def load_config() -> AppConfig:
         experience=env_str("EXPERIENCE"),
         salary=env_str("SALARY"),
         job_age=env_int("JOB_AGE", 1),
+        job_max_age_hours=env_int("JOB_MAX_AGE_HOURS", 0),
         title_include_keywords=title_include_keywords,
         title_exclude_keywords=title_exclude_keywords,
         company_exclude_keywords=company_exclude_keywords,
@@ -557,6 +596,9 @@ class NaukriAutoApply:
             page = (self.driver.page_source or "").lower()
             if any(token in page for token in ("captcha", "otp", "verify mobile", "enter otp")):
                 print("Naukri needs extra verification (captcha/OTP). Complete it in Chrome...")
+                if self.config.headless:
+                    print("HEADLESS=true cannot complete captcha/OTP. Set HEADLESS=false on a machine with a display.")
+                    return False
                 return self.wait_for_manual_login(timeout_seconds=300)
 
         print("Auto-login did not complete in time.")
@@ -577,6 +619,10 @@ class NaukriAutoApply:
             print("Auto-login failed — falling back to manual login.")
         else:
             print("No NAUKRI_PASSWORD in .env — opening login page for manual sign-in.")
+
+        if self.config.headless:
+            print("HEADLESS=true: skipping interactive login. Cached session or auto-login is required.")
+            return False
 
         self.driver.get("https://www.naukri.com/nlogin/login")
         time.sleep(2)
@@ -749,7 +795,17 @@ class NaukriAutoApply:
 
         time.sleep(2)
         age = self.config.job_age
-        if age == 1:
+        hours = self.config.job_max_age_hours
+        if 0 < hours <= 12:
+            option_texts = [
+                "12 hours",
+                "Last 12 hours",
+                "24 hours",
+                "Last 24 hours",
+                "Today",
+                "1 day",
+            ]
+        elif age == 1:
             option_texts = ["24 hours", "Last 24 hours", "Today", "1 day"]
         elif age <= 3:
             option_texts = ["3 days", "Last 3 days"]
@@ -1026,6 +1082,21 @@ class NaukriAutoApply:
                 )
                 return 0
 
+            posted_reason = self.posted_age_skip_reason(job, job_title)
+            if posted_reason:
+                print(f"Skipping job {index}: '{job_title}' at {company} ({posted_reason})")
+                print(f"  link: {job_url or '(no link)'}")
+                self._note_log_result(
+                    record_application(
+                        job_title,
+                        company,
+                        job_url=job_url,
+                        status="skipped",
+                        reason=posted_reason,
+                    )
+                )
+                return 0
+
             print(f"Opening job details for: {job_title} at {company}")
             main_window = self.driver.current_window_handle
             opened = self.open_job_in_new_tab(job_link)
@@ -1116,6 +1187,51 @@ class NaukriAutoApply:
             except WebDriverException:
                 continue
         return "Unknown"
+
+    def extract_posted_label(self, job) -> str:
+        posted_selectors = [
+            ".job-post-day",
+            ".jobTupleFooter .posted-date",
+            "[class*='job-post']",
+            "[class*='posted']",
+            ".type.brite",
+            "span.fleft.fw500",
+        ]
+        for selector in posted_selectors:
+            try:
+                for node in job.find_elements(By.CSS_SELECTOR, selector):
+                    text = (node.text or "").strip()
+                    if text and posted_age_hours_from_text(text) is not None:
+                        return text
+                    if text and re.search(r"ago|just now|today|yesterday", text, re.I):
+                        return text
+            except WebDriverException:
+                continue
+        try:
+            blob = (job.text or "").strip()
+        except WebDriverException:
+            return ""
+        match = re.search(
+            r"(just now|few hours ago|yesterday|\d+\s*(?:minute|min|hour|hr|hrs|day|week|month)s?\s*ago)",
+            blob,
+            flags=re.I,
+        )
+        return match.group(1) if match else ""
+
+    def posted_age_skip_reason(self, job, job_title: str) -> str | None:
+        max_hours = self.config.job_max_age_hours
+        if max_hours <= 0:
+            return None
+        label = self.extract_posted_label(job)
+        hours = posted_age_hours_from_text(label)
+        if hours is None:
+            if label:
+                print(f"Posted time unparsed for '{job_title}': {label!r} — keeping under {max_hours}h Naukri filter.")
+            return None
+        if hours > max_hours:
+            pretty = label or f"~{hours:g}h ago"
+            return f"posted {pretty} (older than {max_hours} hours)"
+        return None
 
     def open_job_in_new_tab(self, job_link):
         try:
@@ -1986,6 +2102,9 @@ def create_chrome_driver(headless=False, chrome_driver_path="", chrome_profile_d
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
         chrome_options.add_argument("--disable-renderer-backgrounding")
         chrome_options.add_argument("--remote-allow-origins=*")
+        chrome_options.add_argument(
+            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.137 Safari/537.36"
+        )
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
 
@@ -1998,6 +2117,7 @@ def create_chrome_driver(headless=False, chrome_driver_path="", chrome_profile_d
 
         if headless:
             chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--window-size=1920,1080")
 
     def _launch():
         if chrome_driver_path:
@@ -2111,6 +2231,8 @@ def main():
         print(f"Keywords: {', '.join(app_config.keywords)}")
         print(f"Locations: {', '.join(app_config.locations)}")
         print(f"Job Age (Freshness): {app_config.job_age} day(s)")
+        if app_config.job_max_age_hours:
+            print(f"Max job age: {app_config.job_max_age_hours} hour(s)")
         print(f"Title Include Filters: {', '.join(app_config.title_include_keywords)}")
         print(f"Title Exclude Filters: {', '.join(app_config.title_exclude_keywords)}")
         print(f"Company Exclude Filters: {', '.join(app_config.company_exclude_keywords)}")
